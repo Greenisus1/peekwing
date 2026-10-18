@@ -79,3 +79,14 @@ Send the PIN in an `X-Pin` header.
     python3 -m unittest tests/test_peekwing.py
 
 The HTTP, PIN, lockout, expiry, view-only and coordinate logic are tested with a fake screen. The macOS capture and input calls (screencapture, sips, osascript) need a real Mac.
+
+## Optional: Hurdle Jumper auto-jump (extras/hurdlebot.py)
+
+A separate helper for the Hurdle Jumper arcade cabinet in Sneaky Sasquatch. It watches the cabinet screen, measures how fast the yellow hurdle is moving (the speed grows during a round), and clicks the red button just before contact. It only ever clicks the red button, never inserts coins (you click the coin slot) and stops with Ctrl+C.
+
+    python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --calibrate   # prints what it sees, no clicks
+    python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --dry         # detects and logs, no clicks
+    python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --plays 3     # plays up to 3 rounds (3 coins' worth x 5), then stops
+
+`--lead 0.30` is how many seconds before contact it presses. Between rounds it tries nearby values and keeps the best one (`--no-tune` to turn that off). Needs Screen Recording and Accessibility for Terminal.
+The screen layout numbers (where the cabinet screen and button are) are estimates from screenshots at default zoom, so run `--calibrate` first.
