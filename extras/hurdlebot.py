@@ -24,6 +24,10 @@ BUTTON = (0.504, 0.588)       # the big red button, fractions of the screen
 GRAB_W = 320                  # capture width of the region, small = fast
 BAND = (0.50, 0.95)           # rows (fraction of region height) where hurdles run
 SCAN_STEP = 2
+LEAD_MIN, LEAD_MAX = 0.05, 0.25   # tuning never leaves this range (seconds before contact)
+# Speed model measured from a recording: hurdle speed in a 394 px wide cabinet screen is
+# about 174 px/s at the first hurdle and grows about 6 px/s every second after it.
+SPEED0, SPEED_GAIN, SPEED_REF_W = 174.0, 6.0, 394.0
 
 
 def is_yellow(r, g, b):
@@ -67,13 +71,19 @@ def analyze(px, w, h):
 
 
 class Bot:
-    def __init__(self, grab, click, clock=time.time, lead=0.30, plays=3, tune=True, dry=False, say=print):
+    def __init__(self, grab, click, clock=time.time, lead=0.12, plays=3, tune=True, dry=False, say=print):
         self.grab, self.click, self.clock = grab, click, clock
         self.lead, self.plays, self.tune, self.dry, self.say = lead, plays, tune, dry, say
         self.lead0 = lead
         self.scores = {}
         # try the starting lead, then spiral outward; afterwards stick with the best one
-        self.candidates = [min(0.9, max(0.05, lead + d)) for d in (0, -0.08, 0.08, -0.16, 0.16, -0.24, 0.24)]
+        # (measured from a real run: cleared jumps left the ground -0.10..+0.23 s around contact)
+        base = min(LEAD_MAX, max(LEAD_MIN, lead))
+        self.candidates = []
+        for d in (0, -0.03, 0.03, -0.06, 0.06, -0.09, 0.09):
+            c = round(min(LEAD_MAX, max(LEAD_MIN, base + d)), 3)
+            if c not in self.candidates:
+                self.candidates.append(c)
         self.reset_round()
         self.round_no = 0
         self.runner_x = None
@@ -82,6 +92,12 @@ class Bot:
         self.samples, self.jumped, self.cleared = [], False, 0
         self.seen_moving, self.last_move_t, self.stuck_since = False, None, None
         self.last_seen_t = None
+        self.round_t0 = None          # time of the first hurdle seen this round (speed model clock)
+
+    def seed_v(self, t, w):
+        """Expected hurdle speed (px/s, negative = leftwards) at time t, scaled to this capture width."""
+        age = 0.0 if self.round_t0 is None else max(0.0, t - self.round_t0)
+        return -(SPEED0 + SPEED_GAIN * age) * w / SPEED_REF_W
 
     def fit_v(self):
         s = self.samples[-5:]
@@ -106,16 +122,21 @@ class Bot:
             self.samples.append((t, front))
             self.samples = self.samples[-8:]
             self.last_seen_t = t
+            if self.round_t0 is None:
+                self.round_t0 = t
             v = self.fit_v()
-            if v is not None and v < -20:
+            moving = v is not None and v < -20
+            if moving:
                 self.seen_moving, self.last_move_t, self.stuck_since = True, t, None
-                est = front + v * (self.clock() - t)
-                t_hit = (est - rxr) / -v
+            vuse = v if moving else self.seed_v(t, w)     # fire on the first sighting using the model speed
+            if v is None or moving:
+                est = front + vuse * (self.clock() - t)
+                t_hit = (est - rxr) / -vuse
                 if not self.jumped and t_hit <= self.lead:
                     self.jumped = True
                     if not self.dry:
                         self.click()
-                    self.say("jump: hurdle %.0fpx away, %.0f px/s, %.2fs to contact" % (est - rxr, -v, t_hit))
+                    self.say("jump: hurdle %.0fpx away, %.0f px/s (%s), %.2fs to contact" % (est - rxr, -vuse, "measured" if moving else "model", t_hit))
             elif v is not None and self.seen_moving:
                 self.stuck_since = self.stuck_since or t        # hurdle stopped moving: the runner hit it
                 if t - self.stuck_since > 0.8:
@@ -145,7 +166,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Auto-jump helper for Hurdle Jumper.")
     ap.add_argument("--plays", type=int, default=3, help="stop after this many rounds (coin cap, 5 coins each)")
     ap.add_argument("--seconds", type=int, default=180, help="hard time limit")
-    ap.add_argument("--lead", type=float, default=0.30, help="press this many seconds before contact")
+    ap.add_argument("--lead", type=float, default=0.12, help="press this many seconds before contact")
     ap.add_argument("--no-tune", action="store_true", help="keep --lead fixed between rounds")
     ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--dry", action="store_true")
