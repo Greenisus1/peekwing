@@ -58,6 +58,14 @@ On a school or work managed Mac these switches can be locked.
 
 Open the printed `/share` link in your browser and pick a screen or window to share. Control is not available in this mode. Your browser may itself need the Screen Recording permission.
 
+## Speed
+
+Frames are grabbed in-process (CoreGraphics/ImageIO), which is much faster than the old `screencapture` path; if that is unavailable it falls back automatically and says so in the Terminal log. Measure your Mac: `python3 ~/CrunchByte/Peekwing/peekwing.py --bench`.
+
+- `GET /stream?w=800&q=45&fps=10` is a live MJPEG stream (w 320-1600, q 10-90, fps 1-30). Unchanged screens send only a keep-alive frame per second.
+- `POST /input {"w":1280,"ops":[...]}` runs up to 60 mouse/key ops in one call: `move, mdown, mup, click, drag, scroll, kdown, kup, wait` (keys by name such as `space`, `left`, `w`; waits max 1000 ms each, 5 s total). Needs control on.
+- `tools/pwclient.py` records a stream to image files and prints the real frames per second.
+
 ## Helper API (for the person or agent on the other side)
 
 Send the PIN in an `X-Pin` header.
