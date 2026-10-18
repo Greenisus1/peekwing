@@ -9,8 +9,12 @@ import tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 MAX_BAD_PINS = 5
+
+
+def word(v):
+    return {True: "on", False: "OFF", None: "unknown"}[v]
 DEFAULT_W = 1280
 
 KEYCODES = {"return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51,
@@ -82,11 +86,23 @@ class MacBackend:
             self.size = (1440, 900)
 
     def permissions(self):
-        r = sh(["osascript", "-l", "JavaScript", "-e", PERM_JXA])
+        """Ask macOS directly through ctypes. None means the check itself could not run."""
+        out = {"screen": None, "accessibility": None}
         try:
-            return json.loads(r.stdout)
+            import ctypes
+            cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+            out["screen"] = bool(cg.CGPreflightScreenCaptureAccess())
         except Exception:
-            return {"screen": None, "accessibility": None}
+            pass
+        try:
+            import ctypes
+            ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+            ax.AXIsProcessTrusted.restype = ctypes.c_bool
+            out["accessibility"] = bool(ax.AXIsProcessTrusted())
+        except Exception:
+            pass
+        return out
 
     def screenshot(self, w):
         raw = os.path.join(self.work, "raw.jpg")
@@ -108,8 +124,14 @@ class MacBackend:
         sh(["osascript", "-l", "JavaScript", self.mouse_js, json.dumps(a)])
 
     def type_text(self, text):
-        sh(["osascript", "-e", "on run argv", "-e",
-            'tell application "System Events" to keystroke (item 1 of argv)', "-e", "end run", text])
+        # one character at a time with a short delay so fast typing cannot drop spaces
+        script = ['on run argv', 'tell application "System Events"',
+                  'repeat with ch in (characters of (item 1 of argv))', 'keystroke (contents of ch)',
+                  'delay 0.04', 'end repeat', 'end tell', 'end run']
+        cmd = ["osascript"]
+        for line in script:
+            cmd += ["-e", line]
+        sh(cmd + [text], timeout=max(20, int(len(text) * 0.2) + 10))
 
     def key(self, key, mods):
         using = ""
@@ -639,7 +661,7 @@ def main(argv=None, backend=None):
             backend = MacBackend()
     perms = backend.permissions()
     if args.check:
-        print("Screen Recording:", perms.get("screen"), " Accessibility:", perms.get("accessibility"))
+        print("Screen Recording: %s   Accessibility: %s" % (word(perms.get("screen")), word(perms.get("accessibility"))))
         backend.cleanup()
         return 0
     pin = "%06d" % secrets.randbelow(1000000)
@@ -665,7 +687,7 @@ def main(argv=None, backend=None):
         print("  Open this in your browser to start sharing:  http://127.0.0.1:%d/share?pin=%s" % (port, pin))
     print("  Stops in %d min, or press Ctrl+C, or type q + Enter." % args.minutes)
     print("  Type c + Enter to let your helper click and type. Off now.")
-    print("  Screen Recording permission: %s   Accessibility: %s" % (perms.get("screen"), perms.get("accessibility")))
+    print("  Screen Recording: %s   Accessibility: %s" % (word(perms.get("screen")), word(perms.get("accessibility"))))
     if perms.get("screen") is False:
         print("  -> Screen Recording is off. System Settings > Privacy & Security > Screen Recording > turn on Terminal, then restart Terminal.")
     if perms.get("accessibility") is False:
