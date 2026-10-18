@@ -9,7 +9,7 @@ import tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 MAX_BAD_PINS = 5
 
 
