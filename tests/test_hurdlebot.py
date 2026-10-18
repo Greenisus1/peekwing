@@ -107,6 +107,28 @@ class T(unittest.TestCase):
         self.assertLessEqual(bot.lead, 0.62)                           # then it moved to a working lead
         self.assertGreaterEqual(sim.cleared, 3)                   # and kept clearing hurdles
 
+    def test_defaults_and_tuning_bounds(self):
+        bot = hb.Bot(lambda: None, lambda: None, say=lambda *a: None)
+        self.assertAlmostEqual(bot.lead, 0.12)
+        self.assertTrue(all(hb.LEAD_MIN <= c <= hb.LEAD_MAX for c in bot.candidates))
+        self.assertEqual(bot.candidates[0], 0.12)
+        self.assertEqual(len(bot.candidates), len(set(bot.candidates)))
+        steps = sorted(set(round(abs(c - 0.12), 3) for c in bot.candidates))
+        self.assertEqual(steps, [0.0, 0.03, 0.06, 0.07, 0.09])   # -0.09 clamps to the 0.05 floor
+
+    def test_speed_seed_grows_and_scales(self):
+        bot = hb.Bot(lambda: None, lambda: None, say=lambda *a: None)
+        bot.round_t0 = 0.0
+        self.assertAlmostEqual(bot.seed_v(0.0, 394), -174.0)
+        self.assertAlmostEqual(bot.seed_v(10.0, 394), -234.0)
+        self.assertAlmostEqual(bot.seed_v(0.0, 320), -174.0 * 320 / 394)
+
+    def test_default_lead_clears_and_fires_without_measured_speed(self):
+        sim = Sim(period=1.2)
+        run(sim, 0.12, rounds=1, seconds=14)
+        self.assertGreaterEqual(sim.cleared, 4)
+        self.assertEqual(sim.faults, 0, "clicks at %s" % sim.clicks)
+
     def test_fault_ends_round(self):
         sim = Sim()
         bot = run(sim, 0.9, rounds=1, seconds=30)
