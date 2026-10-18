@@ -9,7 +9,7 @@ import tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 MAX_BAD_PINS = 5
 
 
@@ -274,6 +274,32 @@ class FastCapture:
         self.cs = cg.CGColorSpaceCreateDeviceRGB()
         self.display = cg.CGMainDisplayID()
         self.opts = {}
+
+    def pixels(self, region, w):
+        """Raw RGBX pixels of a screen region (fractions x,y,w,h) scaled to width w: (bytes, w, h)."""
+        C, cg = self.C, self.cg
+        full = cg.CGDisplayCreateImage(self.display)
+        if not full:
+            raise RuntimeError("CGDisplayCreateImage returned nothing")
+        img = full
+        ctx = None
+        try:
+            fw, fh = cg.CGImageGetWidth(full), cg.CGImageGetHeight(full)
+            rx, ry, rw, rh = region
+            img = cg.CGImageCreateWithImageInRect(full, self.Rc(self.Pt(rx * fw, ry * fh), self.Sz(rw * fw, rh * fh)))
+            iw, ih = cg.CGImageGetWidth(img), cg.CGImageGetHeight(img)
+            ow, oh = int(w), max(1, int(round(ih * w / float(iw))))
+            buf = (C.c_ubyte * (ow * oh * 4))()
+            ctx = cg.CGBitmapContextCreate(C.addressof(buf), ow, oh, 8, ow * 4, self.cs, 5)
+            cg.CGContextSetInterpolationQuality(ctx, 1)
+            cg.CGContextDrawImage(ctx, self.Rc(self.Pt(0, 0), self.Sz(ow, oh)), img)
+            return bytes(buf), ow, oh
+        finally:
+            if ctx:
+                cg.CGContextRelease(ctx)
+            if img != full:
+                cg.CGImageRelease(img)
+            cg.CGImageRelease(full)
 
     def _props(self, q):
         C = self.C
