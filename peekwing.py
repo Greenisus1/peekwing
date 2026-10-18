@@ -9,7 +9,7 @@ import tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 MAX_BAD_PINS = 5
 
 
@@ -201,7 +201,7 @@ class State:
         self.cfg_path = cfg_path
         self._control = False
         self.persistent = cfg_path is not None
-        self.deadline = time.time() + minutes * 60
+        self.deadline = time.time() + minutes * 60 if minutes else float("inf")  # 0 = no limit
         self.bad = 0
         self.locked_until = 0
         self.stop = threading.Event()
@@ -304,7 +304,7 @@ def make_handler(st):
             if u.path == "/status":
                 return self._send(200, {"version": VERSION, "view": st.view, "control": st.control,
                                         "screen": list(st.backend.size),
-                                        "seconds_left": int(st.deadline - time.time()),
+                                        "seconds_left": None if st.deadline == float("inf") else int(st.deadline - time.time()),
                                         "permissions": st.backend.permissions()})
             if u.path == "/screen":
                 if not st.view:
@@ -644,7 +644,8 @@ def main(argv=None, backend=None):
     if argv and argv[0] in cmds:
         return cmds[argv[0]](argv[1:])
     ap = argparse.ArgumentParser(description="Peekwing: share your screen without admin.")
-    ap.add_argument("--minutes", type=int, default=30, help="auto-stop after this long (default 30)")
+    ap.add_argument("--minutes", type=int, default=None,
+                    help="auto-stop after this many minutes; 0 = no limit until you quit. Asked at start if omitted.")
     ap.add_argument("--local", action="store_true", help="no tunnel, localhost only (testing)")
     ap.add_argument("--browser", action="store_true",
                     help="view-only fallback: share one screen/window from a browser tab, no Terminal permissions")
@@ -664,8 +665,18 @@ def main(argv=None, backend=None):
         print("Screen Recording: %s   Accessibility: %s" % (word(perms.get("screen")), word(perms.get("accessibility"))))
         backend.cleanup()
         return 0
+    minutes = args.minutes
+    if minutes is None:
+        minutes = 30
+        if sys.stdin.isatty():
+            try:
+                ans = input("How many minutes should sharing last? (Enter = 30, 0 = no limit until you quit): ").strip()
+                minutes = int(ans) if ans else 30
+            except (ValueError, EOFError):
+                print("Not a number, using 30.")
+    minutes = max(0, minutes)
     pin = "%06d" % secrets.randbelow(1000000)
-    st = State(backend, pin, args.minutes)
+    st = State(backend, pin, minutes)
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(st))
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -685,7 +696,10 @@ def main(argv=None, backend=None):
     print("  PIN:     " + pin)
     if backend.name == "browser":
         print("  Open this in your browser to start sharing:  http://127.0.0.1:%d/share?pin=%s" % (port, pin))
-    print("  Stops in %d min, or press Ctrl+C, or type q + Enter." % args.minutes)
+    if minutes:
+        print("  DURATION: stops by itself in %d minutes. Or press Ctrl+C, or type q + Enter." % minutes)
+    else:
+        print("  DURATION: NO TIME LIMIT. Stays on until you press Ctrl+C or type q + Enter.")
     print("  Type c + Enter to let your helper click and type. Off now.")
     print("  Screen Recording: %s   Accessibility: %s" % (word(perms.get("screen")), word(perms.get("accessibility"))))
     if perms.get("screen") is False:
