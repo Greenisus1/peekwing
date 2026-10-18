@@ -86,7 +86,7 @@ A separate helper for the Hurdle Jumper arcade cabinet in Sneaky Sasquatch. It w
 
     python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --calibrate   # prints what it sees, no clicks
     python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --dry         # detects and logs, no clicks
-    python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --plays 3     # plays up to 3 rounds (3 coins' worth x 5), then stops
+    python3 ~/CrunchByte/Peekwing/extras/hurdlebot.py --plays 3     # plays up to 3 rounds (default lead 0.12 s, tuned within 0.05-0.25 s) (3 coins' worth x 5), then stops
 
 `--lead 0.30` is how many seconds before contact it presses. Between rounds it tries nearby values and keeps the best one (`--no-tune` to turn that off). Needs Screen Recording and Accessibility for Terminal.
 The screen layout numbers (where the cabinet screen and button are) are estimates from screenshots at default zoom, so run `--calibrate` first.
