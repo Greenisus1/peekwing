@@ -12,11 +12,11 @@ Built with AI assistance from my design. MIT license.
 
     ~/CrunchByte/Peekwing/Peekwing.command
 
-It prints an address and a 6-digit PIN (and copies them to your clipboard). Send both to your helper. Sharing starts **view only**.
+It prints an address and a 6-digit PIN (and copies them to your clipboard). Send both to your helper. Control (click and type) starts off.
 
 - `c` + Enter: turn control (click and type) on or off. Off by default; only you can switch it on, from this window.
 - `q` + Enter or Ctrl+C: stop everything. Closing the Terminal window also stops it.
-- Auto-stops after 30 minutes (`--minutes N` to change).
+- Duration: it asks how long to share when it starts (Enter = 30 minutes, `0` = no limit until you quit). Or pass `--minutes N` (`--minutes 0` = no limit). The banner shows the choice.
 - 5 wrong PINs shut it down.
 - Nothing is recorded or saved. Screenshots are made on demand and deleted right away.
 - A notification and the open Terminal window show that sharing is on. Every helper action is printed there.
