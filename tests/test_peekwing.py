@@ -64,6 +64,13 @@ class T(unittest.TestCase):
         self.st.deadline = 0
         self.assertEqual(self.req("/status")[0], 410)
 
+    def test_no_limit_session(self):
+        st = pw.State(self.b, "1", 0)
+        self.assertFalse(st.expired())
+        self.assertEqual(st.deadline, float("inf"))
+        st2 = pw.State(self.b, "1", 30)
+        self.assertFalse(st2.expired())
+
     def test_public_root_leaks_nothing(self):
         c, body, _ = self.req("/", pin="")
         self.assertEqual(body, b"peekwing up\n")
