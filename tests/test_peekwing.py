@@ -8,7 +8,13 @@ class Fake:
     size = (1000, 600)
     def __init__(self): self.calls = []
     def permissions(self): return {"screen": True, "accessibility": True}
+    n = 0
     def screenshot(self, w): self.calls.append(("shot", w)); return b"\xff\xd8fake"
+    def frame(self, w, q, region=None):
+        self.last_region = region
+        self.n += 1
+        return b"\xff\xd8" + (b"A" if self.n % 2 else b"B") * 50   # alternates so every frame counts as changed
+    def input(self, ops): self.calls.append(("input", ops))
     def mouse(self, **a): self.calls.append(("mouse", a))
     def type_text(self, t): self.calls.append(("type", t))
     def key(self, k, m): self.calls.append(("key", k, m))
@@ -39,7 +45,7 @@ class T(unittest.TestCase):
 
     def test_screen_ok_and_size_header(self):
         c, body, h = self.req("/screen?w=800")
-        self.assertEqual(c, 200); self.assertEqual(h["X-Screen-W"], "1000"); self.assertEqual(self.b.calls[0], ("shot", 800))
+        self.assertEqual(c, 200); self.assertEqual(h["X-Screen-W"], "1000"); self.assertTrue(body.startswith(b"\xff\xd8"))
 
     def test_view_only_blocks_control(self):
         self.assertEqual(self.req("/click", {"x": 1, "y": 1})[0], 403)
@@ -70,6 +76,47 @@ class T(unittest.TestCase):
         self.assertEqual(st.deadline, float("inf"))
         st2 = pw.State(self.b, "1", 30)
         self.assertFalse(st2.expired())
+
+    def test_stream_delivers_frames_and_obeys_view(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+        import pwclient, tempfile
+        d = tempfile.mkdtemp()
+        n, secs = pwclient.stream(self.base, "123456", d, seconds=1.5, w=640, q=40, fps=20)
+        self.assertGreaterEqual(n, 8)                       # fake backend is instant, so the rate is the cap
+        self.assertTrue(open(os.path.join(d, "f0000.jpg"), "rb").read().startswith(b"\xff\xd8"))
+        self.assertEqual(self.req("/stream", pin="nope")[0], 401)
+
+    def test_stream_skips_unchanged_frames(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+        import pwclient, tempfile
+        self.b.frame = lambda w, q: b"\xff\xd8same"
+        n, secs = pwclient.stream(self.base, "123456", tempfile.mkdtemp(), seconds=2.2, fps=20)
+        self.assertLessEqual(n, 4)                          # only ~1 keep-alive frame per second
+
+    def test_input_batch(self):
+        self.st.control = True
+        ops = [{"t": "move", "x": 640, "y": 400}, {"t": "kdown", "key": "space"}, {"t": "wait", "ms": 80},
+               {"t": "kup", "key": "space"}, {"t": "click", "x": 0, "y": 0, "count": 2}]
+        self.assertEqual(self.req("/input", {"w": 1280, "ops": ops})[0], 200)
+        sent = self.b.calls[-1][1]
+        self.assertEqual(sent[0]["x"], 500.0)               # 640 * (1000/1280)... scaled to screen points
+        self.assertEqual(sent[1]["code"], 49)
+        self.assertEqual(len(sent), 5)
+
+    def test_input_rejects_bad_ops(self):
+        self.st.control = True
+        for ops in ([{"t": "kdown", "key": "nonsense"}], [{"t": "rm"}], [{"t": "wait", "ms": 1000}] * 6, "x"):
+            self.assertEqual(self.req("/input", {"ops": ops})[0], 400, ops)
+        self.assertEqual(self.b.calls, [])
+
+    def test_input_needs_control(self):
+        self.assertEqual(self.req("/input", {"ops": [{"t": "move", "x": 1, "y": 1}]})[0], 403)
+
+    def test_region_param(self):
+        c, body, h = self.req("/screen?region=0.25,0.1,0.5,0.4&w=480")
+        self.assertEqual(c, 200); self.assertEqual(self.b.last_region, (0.25, 0.1, 0.5, 0.4))
+        self.assertEqual(self.req("/stream?region=0.9,0.9,0.5,0.5")[0], 400)
+        self.assertEqual(self.req("/screen?region=0.9,0.9,0.5,0.5")[0], 503)
 
     def test_public_root_leaks_nothing(self):
         c, body, _ = self.req("/", pin="")
