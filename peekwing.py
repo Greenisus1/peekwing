@@ -9,7 +9,7 @@ import tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 MAX_BAD_PINS = 5
 
 
@@ -65,6 +65,273 @@ function run() {
 """
 
 
+LETTERS = {"a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12,
+           "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+           "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34,
+           "p": 35, "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46,
+           ".": 47, "`": 50}
+KEYCODES.update(LETTERS)
+KEYCODES.update({"shift": 56, "control": 59, "ctrl": 59, "option": 58, "alt": 58, "command": 55, "cmd": 55})
+
+INPUT_JXA = r"""
+ObjC.import('CoreGraphics'); ObjC.import('unistd');
+function run(argv) {
+  var ops = JSON.parse(argv[0]);
+  function mouse(t, x, y, b, n) {
+    var e = $.CGEventCreateMouseEvent(null, t, {x: x, y: y}, b);
+    if (n) { $.CGEventSetIntegerValueField(e, $.kCGMouseEventClickState, n); }
+    $.CGEventPost($.kCGHIDEventTap, e);
+  }
+  for (var i = 0; i < ops.length; i++) {
+    var o = ops[i], right = o.button === 'right';
+    var D = right ? $.kCGEventRightMouseDown : $.kCGEventLeftMouseDown;
+    var U = right ? $.kCGEventRightMouseUp : $.kCGEventLeftMouseUp;
+    var B = right ? $.kCGMouseButtonRight : $.kCGMouseButtonLeft;
+    if (o.t === 'move') { mouse($.kCGEventMouseMoved, o.x, o.y, 0, 0); }
+    else if (o.t === 'mdown') { mouse($.kCGEventMouseMoved, o.x, o.y, 0, 0); mouse(D, o.x, o.y, B, 1); }
+    else if (o.t === 'mup') { mouse(U, o.x, o.y, B, 1); }
+    else if (o.t === 'click') {
+      mouse($.kCGEventMouseMoved, o.x, o.y, 0, 0);
+      for (var k = 1; k <= (o.count || 1); k++) { mouse(D, o.x, o.y, B, k); mouse(U, o.x, o.y, B, k); }
+    }
+    else if (o.t === 'drag') {
+      mouse($.kCGEventMouseMoved, o.x, o.y, 0, 0); mouse($.kCGEventLeftMouseDown, o.x, o.y, $.kCGMouseButtonLeft, 1);
+      mouse($.kCGEventLeftMouseDragged, o.x2, o.y2, $.kCGMouseButtonLeft, 1);
+      mouse($.kCGEventLeftMouseUp, o.x2, o.y2, $.kCGMouseButtonLeft, 1);
+    }
+    else if (o.t === 'scroll') {
+      var e = $.CGEventCreateScrollWheelEvent2(null, $.kCGScrollEventUnitLine, 1, o.dy, 0, 0);
+      $.CGEventPost($.kCGHIDEventTap, e);
+    }
+    else if (o.t === 'kdown' || o.t === 'kup') {
+      var ke = $.CGEventCreateKeyboardEvent(null, o.code, o.t === 'kdown');
+      $.CGEventPost($.kCGHIDEventTap, ke);
+    }
+    else if (o.t === 'wait') { $.usleep(o.ms * 1000); }
+  }
+  return 'ok';
+}
+"""
+
+
+def build_input_ops(ops, k):
+    """Validate and translate helper ops (screenshot-space coords) into screen-point ops."""
+    out, wait_total = [], 0
+    if not isinstance(ops, list) or len(ops) > 60:
+        raise ValueError("ops must be a list of at most 60")
+    for o in ops:
+        t = o.get("t")
+        if t in ("move", "mdown", "mup", "click", "drag"):
+            m = {"t": t, "x": float(o.get("x", 0)) * k, "y": float(o.get("y", 0)) * k,
+                 "button": "right" if o.get("button") == "right" else "left"}
+            if t == "click":
+                m["count"] = max(1, min(3, int(o.get("count", 1))))
+            if t == "drag":
+                m["x2"] = float(o.get("x2", 0)) * k
+                m["y2"] = float(o.get("y2", 0)) * k
+        elif t == "scroll":
+            m = {"t": t, "dy": max(-50, min(50, int(o.get("dy", 0))))}
+        elif t in ("kdown", "kup"):
+            key = str(o.get("key", "")).lower()
+            if key not in KEYCODES:
+                raise ValueError("unknown key: " + key[:20])
+            m = {"t": t, "code": KEYCODES[key]}
+        elif t == "wait":
+            ms = max(0, min(1000, int(o.get("ms", 0))))
+            wait_total += ms
+            if wait_total > 5000:
+                raise ValueError("too much waiting")
+            m = {"t": t, "ms": ms}
+        else:
+            raise ValueError("unknown op: " + str(t)[:20])
+        out.append(m)
+    return out
+
+
+class FastInput:
+    """Mouse and keyboard events posted in-process (microseconds) instead of spawning osascript."""
+    LD, LU, RD, RU, MV, LDRAG = 1, 2, 3, 4, 5, 6
+
+    def __init__(self):
+        import ctypes as C
+        self.C = C
+        P, D, U32, I32, I64 = C.c_void_p, C.c_double, C.c_uint32, C.c_int32, C.c_int64
+
+        class Pt(C.Structure):
+            _fields_ = [("x", D), ("y", D)]
+        self.Pt = Pt
+        cg = C.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cf = C.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        self.cg, self.cf = cg, cf
+        cg.CGEventCreateMouseEvent.restype = P
+        cg.CGEventCreateMouseEvent.argtypes = [P, U32, Pt, U32]
+        cg.CGEventSetIntegerValueField.restype = None
+        cg.CGEventSetIntegerValueField.argtypes = [P, U32, I64]
+        cg.CGEventPost.restype = None
+        cg.CGEventPost.argtypes = [U32, P]
+        cg.CGEventCreateKeyboardEvent.restype = P
+        cg.CGEventCreateKeyboardEvent.argtypes = [P, C.c_uint16, C.c_bool]
+        cg.CGEventCreateScrollWheelEvent2.restype = P
+        cg.CGEventCreateScrollWheelEvent2.argtypes = [P, U32, U32, I32, I32, I32]
+        cf.CFRelease.restype = None
+        cf.CFRelease.argtypes = [P]
+
+    def _post(self, e):
+        if not e:
+            raise RuntimeError("event not created")
+        self.cg.CGEventPost(0, e)  # kCGHIDEventTap
+        self.cf.CFRelease(e)
+
+    def _mouse(self, t, x, y, b, n=0):
+        e = self.cg.CGEventCreateMouseEvent(None, t, self.Pt(x, y), b)
+        if n:
+            self.cg.CGEventSetIntegerValueField(e, 1, n)  # kCGMouseEventClickState
+        self._post(e)
+
+    def run(self, ops):
+        for o in ops:
+            t = o["t"]
+            right = o.get("button") == "right"
+            d, u, b = (self.RD, self.RU, 1) if right else (self.LD, self.LU, 0)
+            if t == "move":
+                self._mouse(self.MV, o["x"], o["y"], 0)
+            elif t == "mdown":
+                self._mouse(self.MV, o["x"], o["y"], 0)
+                self._mouse(d, o["x"], o["y"], b, 1)
+            elif t == "mup":
+                self._mouse(u, o["x"], o["y"], b, 1)
+            elif t == "click":
+                self._mouse(self.MV, o["x"], o["y"], 0)
+                for i in range(1, o.get("count", 1) + 1):
+                    self._mouse(d, o["x"], o["y"], b, i)
+                    self._mouse(u, o["x"], o["y"], b, i)
+            elif t == "drag":
+                self._mouse(self.MV, o["x"], o["y"], 0)
+                self._mouse(self.LD, o["x"], o["y"], 0, 1)
+                self._mouse(self.LDRAG, o["x2"], o["y2"], 0, 1)
+                self._mouse(self.LU, o["x2"], o["y2"], 0, 1)
+            elif t == "scroll":
+                self._post(self.cg.CGEventCreateScrollWheelEvent2(None, 1, 1, int(o["dy"]), 0, 0))
+            elif t in ("kdown", "kup"):
+                self._post(self.cg.CGEventCreateKeyboardEvent(None, o["code"], t == "kdown"))
+            elif t == "wait":
+                time.sleep(o["ms"] / 1000.0)
+
+
+class FastCapture:
+    """In-process screen grab + scale + JPEG with CoreGraphics/ImageIO through ctypes (no process spawn)."""
+
+    def __init__(self):
+        import ctypes as C
+        self.C = C
+        P, S, U32, D, I32, L = C.c_void_p, C.c_size_t, C.c_uint32, C.c_double, C.c_int32, C.c_long
+
+        class Pt(C.Structure):
+            _fields_ = [("x", D), ("y", D)]
+
+        class Sz(C.Structure):
+            _fields_ = [("w", D), ("h", D)]
+
+        class Rc(C.Structure):
+            _fields_ = [("o", Pt), ("s", Sz)]
+        self.Rc, self.Pt, self.Sz = Rc, Pt, Sz
+        cg = C.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cf = C.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        io = C.CDLL("/System/Library/Frameworks/ImageIO.framework/ImageIO")
+        self.cg, self.cf, self.io = cg, cf, io
+
+        def sig(f, res, *args):
+            f.restype = res
+            f.argtypes = list(args)
+        sig(cg.CGMainDisplayID, U32)
+        sig(cg.CGDisplayCreateImage, P, U32)
+        sig(cg.CGImageCreateWithImageInRect, P, P, Rc)
+        sig(cg.CGImageGetWidth, S, P)
+        sig(cg.CGImageGetHeight, S, P)
+        sig(cg.CGColorSpaceCreateDeviceRGB, P)
+        sig(cg.CGBitmapContextCreate, P, P, S, S, S, S, P, U32)
+        sig(cg.CGContextSetInterpolationQuality, None, P, I32)
+        sig(cg.CGContextDrawImage, None, P, Rc, P)
+        sig(cg.CGBitmapContextCreateImage, P, P)
+        sig(cg.CGContextRelease, None, P)
+        sig(cg.CGImageRelease, None, P)
+        sig(cg.CGColorSpaceRelease, None, P)
+        sig(cf.CFDataCreateMutable, P, P, L)
+        sig(cf.CFDataGetLength, L, P)
+        sig(cf.CFDataGetBytePtr, P, P)
+        sig(cf.CFRelease, None, P)
+        sig(cf.CFStringCreateWithCString, P, P, C.c_char_p, U32)
+        sig(cf.CFNumberCreate, P, P, I32, P)
+        sig(cf.CFDictionaryCreate, P, P, C.POINTER(P), C.POINTER(P), L, P, P)
+        sig(io.CGImageDestinationCreateWithData, P, P, P, S, P)
+        sig(io.CGImageDestinationAddImage, None, P, P, P)
+        sig(io.CGImageDestinationFinalize, C.c_bool, P)
+        self.key_cb = C.addressof(C.c_char.in_dll(cf, "kCFTypeDictionaryKeyCallBacks"))
+        self.val_cb = C.addressof(C.c_char.in_dll(cf, "kCFTypeDictionaryValueCallBacks"))
+        self.q_key = P.in_dll(io, "kImageDestinationLossyCompressionQuality").value if False else \
+            P.in_dll(io, "kCGImageDestinationLossyCompressionQuality").value
+        self.jpeg = cf.CFStringCreateWithCString(None, b"public.jpeg", 0x08000100)
+        self.cs = cg.CGColorSpaceCreateDeviceRGB()
+        self.display = cg.CGMainDisplayID()
+        self.opts = {}
+
+    def _props(self, q):
+        C = self.C
+        if q not in self.opts:
+            val = C.c_double(q / 100.0)
+            num = self.cf.CFNumberCreate(None, 13, C.byref(val))  # kCFNumberDoubleType
+            keys = (C.c_void_p * 1)(self.q_key)
+            vals = (C.c_void_p * 1)(num)
+            self.opts[q] = self.cf.CFDictionaryCreate(None, keys, vals, 1, self.key_cb, self.val_cb)
+        return self.opts[q]
+
+    def frame(self, w, q, region=None):
+        C, cg, cf, io = self.C, self.cg, self.cf, self.io
+        full = cg.CGDisplayCreateImage(self.display)
+        if not full:
+            raise RuntimeError("CGDisplayCreateImage returned nothing")
+        img = full
+        ctx = out = data = dest = None
+        try:
+            if region:  # fractions of the screen: x, y, w, h
+                fw, fh = cg.CGImageGetWidth(full), cg.CGImageGetHeight(full)
+                rx, ry, rw, rh = region
+                crop = cg.CGImageCreateWithImageInRect(
+                    full, self.Rc(self.Pt(rx * fw, ry * fh), self.Sz(max(8, rw * fw), max(8, rh * fh))))
+                if not crop:
+                    raise RuntimeError("crop failed")
+                img = crop
+            iw, ih = cg.CGImageGetWidth(img), cg.CGImageGetHeight(img)
+            ow, oh = int(w), max(1, int(round(ih * w / float(iw))))
+            ctx = cg.CGBitmapContextCreate(None, ow, oh, 8, 0, self.cs, 5)  # NoneSkipLast
+            if not ctx:
+                raise RuntimeError("no bitmap context")
+            cg.CGContextSetInterpolationQuality(ctx, 2)  # low = fast
+            rc = self.Rc(self.Pt(0, 0), self.Sz(ow, oh))
+            cg.CGContextDrawImage(ctx, rc, img)
+            out = cg.CGBitmapContextCreateImage(ctx)
+            data = cf.CFDataCreateMutable(None, 0)
+            dest = io.CGImageDestinationCreateWithData(data, self.jpeg, 1, None)
+            io.CGImageDestinationAddImage(dest, out, self._props(q))
+            if not io.CGImageDestinationFinalize(dest):
+                raise RuntimeError("jpeg encode failed")
+            b = C.string_at(cf.CFDataGetBytePtr(data), cf.CFDataGetLength(data))
+            if b[:2] != b"\xff\xd8":
+                raise RuntimeError("bad jpeg")
+            return b
+        finally:
+            for ref in (dest, data):
+                if ref:
+                    cf.CFRelease(ref)
+            if out:
+                cg.CGImageRelease(out)
+            if ctx:
+                cg.CGContextRelease(ctx)
+            if img != full:
+                cg.CGImageRelease(img)
+            cg.CGImageRelease(full)
+
+
 def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.pop("timeout", 20), **kw)
 
@@ -77,6 +344,13 @@ class MacBackend:
         self.mouse_js = os.path.join(self.work, "mouse.js")
         with open(self.mouse_js, "w") as f:
             f.write(MOUSE_JXA)
+        self.input_js = os.path.join(self.work, "input.js")
+        with open(self.input_js, "w") as f:
+            f.write(INPUT_JXA)
+        self.fast = None
+        self.fast_failed = False
+        self.fast_in = None
+        self.input_failed = False
         r = sh(["osascript", "-l", "JavaScript", "-e",
                 "ObjC.import('CoreGraphics');var b=$.CGDisplayBounds($.CGMainDisplayID());b.size.width+','+b.size.height"])
         try:
@@ -104,12 +378,39 @@ class MacBackend:
             pass
         return out
 
-    def screenshot(self, w):
+    def frame(self, w, q=60, region=None):
+        """Fast path first (in-process, many fps); falls back to screencapture+sips (2-3 fps)."""
+        if not self.fast_failed:
+            try:
+                if self.fast is None:
+                    self.fast = FastCapture()
+                return self.fast.frame(w, q, region)
+            except Exception as e:
+                self.fast_failed = True
+                log("fast capture unavailable (%s) - using the slower screencapture path" % str(e)[:80])
+        return self.screenshot(w, q, region)
+
+    def input(self, ops):
+        if not self.input_failed:
+            try:
+                if self.fast_in is None:
+                    self.fast_in = FastInput()
+                return self.fast_in.run(ops)
+            except Exception as e:
+                self.input_failed = True
+                log("fast input unavailable (%s) - using osascript" % str(e)[:80])
+        sh(["osascript", "-l", "JavaScript", self.input_js, json.dumps(ops)], timeout=15)
+
+    def screenshot(self, w, q=60, region=None):
         raw = os.path.join(self.work, "raw.jpg")
         out = os.path.join(self.work, "out.jpg")
         try:
-            sh(["screencapture", "-x", "-m", "-t", "jpg", raw])
-            sh(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "60",
+            cmd = ["screencapture", "-x", "-m", "-t", "jpg"]
+            if region:
+                sw, sh_ = self.size
+                cmd += ["-R", "%d,%d,%d,%d" % (region[0] * sw, region[1] * sh_, max(8, region[2] * sw), max(8, region[3] * sh_))]
+            sh(cmd + [raw])
+            sh(["sips", "-s", "format", "jpeg", "-s", "formatOptions", str(int(q)),
                 "--resampleWidth", str(w), raw, "--out", out])
             with open(out, "rb") as f:
                 return f.read()
@@ -177,21 +478,21 @@ class BrowserBackend:
     size = (1280, 720)
 
     def __init__(self):
-        self.frame = None
+        self.latest = None
 
     def permissions(self):
         return {"screen": "browser", "accessibility": "n/a"}
 
     def screenshot(self, w):
-        if not self.frame:
+        if not self.latest:
             raise RuntimeError("no frame yet - start sharing in the browser page")
-        return self.frame
+        return self.latest
 
     def mouse(self, **a): raise RuntimeError("view-only")
     type_text = mouse
     def key(self, *a): raise RuntimeError("view-only")
     def notify(self, m): pass
-    def cleanup(self): self.frame = None
+    def cleanup(self): self.latest = None
 
 
 class State:
@@ -243,6 +544,7 @@ def log(msg):
 def make_handler(st):
     class H(BaseHTTPRequestHandler):
         server_version = "Peekwing"
+        protocol_version = "HTTP/1.1"
 
         def log_message(self, *a):
             pass
@@ -260,6 +562,22 @@ def make_handler(st):
                 self.send_header(k, str(v))
             self.end_headers()
             self.wfile.write(body)
+
+        @staticmethod
+        def _region(q):
+            r = (q.get("region") or [""])[0]
+            if not r:
+                return None
+            x, y, w, h = [max(0.0, min(1.0, float(v))) for v in r.split(",")]
+            if x + w > 1.0001 or y + h > 1.0001 or w < 0.01 or h < 0.01:
+                raise ValueError("region must be fractions x,y,w,h inside the screen")
+            return (x, y, w, h)
+
+        def _grab(self, w, q, region=None):
+            fn = getattr(st.backend, "frame", None)
+            if not fn:
+                return st.backend.screenshot(w)
+            return fn(w, q, region) if region else fn(w, q)
 
         def _auth(self):
             if st.expired():
@@ -310,14 +628,52 @@ def make_handler(st):
                 if not st.view:
                     return self._send(403, {"error": "view is off: the owner has not switched it on"})
                 w = max(320, min(3000, int((q.get("w") or [DEFAULT_W])[0])))
+                qual = max(10, min(95, int((q.get("q") or [60])[0])))
                 try:
-                    data = st.backend.screenshot(w)
+                    data = self._grab(w, qual, self._region(q))
                 except Exception as e:
                     return self._send(503, {"error": str(e)[:200]})
                 self._announce("screen")
                 return self._send(200, data, "image/jpeg", {"X-Screen-W": st.backend.size[0],
                                                            "X-Screen-H": st.backend.size[1]})
+            if u.path == "/stream":
+                if not st.view:
+                    return self._send(403, {"error": "view is off: the owner has not switched it on"})
+                return self._stream(q)
             self._send(404, {"error": "not found"})
+
+        def _stream(self, q):
+            w = max(320, min(1600, int((q.get("w") or [800])[0])))
+            qual = max(10, min(90, int((q.get("q") or [45])[0])))
+            fps = max(1, min(60, int((q.get("fps") or [10])[0])))
+            try:
+                region = self._region(q)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=pwframe")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self._announce("stream %dpx q%d up to %dfps%s" % (w, qual, fps, " (region)" if region else ""))
+            last, sent_at = None, 0.0
+            try:
+                while not st.stop.is_set() and not st.expired() and st.view:
+                    t0 = time.time()
+                    data = self._grab(w, qual, region)
+                    h = hashlib.md5(data).digest()
+                    if h != last or t0 - sent_at > 1.0:  # unchanged screen: send only a keep-alive frame per second
+                        self.wfile.write(b"--pwframe\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(data)
+                                         + data + b"\r\n")
+                        self.wfile.flush()
+                        last, sent_at = h, t0
+                    time.sleep(max(0.0, 1.0 / fps - (time.time() - t0)))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            except Exception as e:
+                log("stream stopped: " + str(e)[:80])
+            log("stream ended")
 
         def do_POST(self):
             if not self._auth():
@@ -326,7 +682,7 @@ def make_handler(st):
                 n = int(self.headers.get("Content-Length") or 0)
                 if n > 3000000:
                     return self._send(413, {"error": "too big"})
-                st.backend.frame = self.rfile.read(n)
+                st.backend.latest = self.rfile.read(n)
                 st.backend.size = (1280, 720)
                 return self._send(200, {"ok": True})
             try:
@@ -335,7 +691,7 @@ def make_handler(st):
             except Exception:
                 return self._send(400, {"error": "bad json"})
             op = urlparse(self.path).path.strip("/")
-            if op not in ("click", "move", "drag", "scroll", "type", "key"):
+            if op not in ("click", "move", "drag", "scroll", "type", "key", "input"):
                 return self._send(404, {"error": "not found"})
             if not st.view:
                 return self._send(403, {"error": "view is off: the owner has not switched it on"})
@@ -345,7 +701,11 @@ def make_handler(st):
             ref = float(a.get("w") or DEFAULT_W)
             k = st.backend.size[0] / ref
             try:
-                if op in ("click", "move", "drag", "scroll"):
+                if op == "input":
+                    ops = build_input_ops(a.get("ops"), k)
+                    st.backend.input(ops)
+                    self._announce("input batch of %d" % len(ops))
+                elif op in ("click", "move", "drag", "scroll"):
                     m = {"op": op, "x": float(a.get("x", 0)) * k, "y": float(a.get("y", 0)) * k}
                     if op == "click":
                         m["button"] = "right" if a.get("button") == "right" else "left"
@@ -368,6 +728,8 @@ def make_handler(st):
                         return self._send(400, {"error": "bad key or mods"})
                     st.backend.key(key, mods)
                     self._announce("key %s%s" % ("+".join(mods) + "+" if mods else "", key))
+            except ValueError as e:
+                return self._send(400, {"error": str(e)[:200]})
             except Exception as e:
                 return self._send(500, {"error": str(e)[:200]})
             self._send(200, {"ok": True})
@@ -649,6 +1011,7 @@ def main(argv=None, backend=None):
     ap.add_argument("--local", action="store_true", help="no tunnel, localhost only (testing)")
     ap.add_argument("--browser", action="store_true",
                     help="view-only fallback: share one screen/window from a browser tab, no Terminal permissions")
+    ap.add_argument("--bench", action="store_true", help="measure capture speed on this Mac and exit")
     ap.add_argument("--check", action="store_true", help="only show permission status and exit")
     ap.add_argument("--port", type=int, default=0)
     args = ap.parse_args(argv)
@@ -661,6 +1024,21 @@ def main(argv=None, backend=None):
         else:
             backend = MacBackend()
     perms = backend.permissions()
+    if args.bench:
+        for w, q, rg in ((640, 40, None), (800, 45, None), (1280, 60, None), (480, 40, (0.25, 0.1, 0.5, 0.4))):
+            t0, n, size = time.time(), 0, 0
+            try:
+                while time.time() - t0 < 3:
+                    size += len(backend.frame(w, q, rg) if rg else backend.frame(w, q))
+                    n += 1
+            except Exception as e:
+                print("width %d: failed: %s" % (w, e))
+                continue
+            dt = time.time() - t0
+            print("width %4d q%d%s: %.1f frames/s, %d KB/frame (%s path)" % (
+                w, q, " small region" if rg else "", n / dt, size // max(n, 1) // 1024, "slow" if getattr(backend, "fast_failed", False) else "fast"))
+        backend.cleanup()
+        return 0
     if args.check:
         print("Screen Recording: %s   Accessibility: %s" % (word(perms.get("screen")), word(perms.get("accessibility"))))
         backend.cleanup()
